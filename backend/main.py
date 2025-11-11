@@ -2,6 +2,8 @@
 import httpx
 import json
 import time
+import zipfile
+import io
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -35,29 +37,47 @@ async def get_air_quality():
         print(f"[Cache] Utilisation du cache (âge: {int(current_time - cache_timestamp)}s)")
         return cache_data
 
-    print(f"[API] Appel à l'API Gwad'Air...")
+    print("[API] Appel à l'API Gwad'Air...")
 
     # Si le cache est expiré ou n'existe pas, faire un nouvel appel API
     try:
         from datetime import datetime, timedelta
 
-        # Obtenir la date d'aujourd'hui et demain au format YYYY-MM-DD
-        today = datetime.now().strftime('%Y-%m-%d')
-        tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
-
-        # Construire la requête pour obtenir les données d'aujourd'hui
-        params = {
-            'where': f"date_ech >= '{today}' AND date_ech <= '{tomorrow}'",
-            'outFields': '*',
-            'returnGeometry': 'false',
-            'outSR': '4326',
-            'f': 'json'
-        }
-
         async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
-            response = await client.get(GWADAIR_API_BASE_URL, params=params)
+            # Essayer d'abord les données d'aujourd'hui
+            today = datetime.now().strftime('%Y-%m-%d')
+            tomorrow = (datetime.now() + timedelta(days=1)).strftime('%Y-%m-%d')
+
+            params_today = {
+                'where': f"date_ech >= '{today}' AND date_ech <= '{tomorrow}'",
+                'outFields': '*',
+                'returnGeometry': 'false',
+                'outSR': '4326',
+                'f': 'json',
+                'orderByFields': 'date_ech DESC'  # Les plus récentes en premier
+            }
+
+            response = await client.get(GWADAIR_API_BASE_URL, params=params_today)
             response.raise_for_status()
             data = response.json()
+
+            # Si pas de données pour aujourd'hui, essayer hier
+            if not data.get("features") or len(data.get("features", [])) == 0:
+                print("[API] Aucune donnée pour aujourd'hui, récupération des données d'hier...")
+                yesterday = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+
+                params_yesterday = {
+                    'where': f"date_ech >= '{yesterday}' AND date_ech < '{today}'",
+                    'outFields': '*',
+                    'returnGeometry': 'false',
+                    'outSR': '4326',
+                    'f': 'json',
+                    'orderByFields': 'date_ech DESC'
+                }
+
+                response = await client.get(GWADAIR_API_BASE_URL, params=params_yesterday)
+                response.raise_for_status()
+                data = response.json()
 
             # Transformer les données ArcGIS en format attendu par le frontend
             formatted_data = {}
@@ -82,13 +102,27 @@ async def get_air_quality():
                     if max_date is None or date_ech > max_date:
                         max_date = date_ech
 
+                # Ne garder que la donnée la plus récente pour chaque commune
+                if code_zone not in formatted_data:
+                    formatted_data[code_zone] = attrs
+                    communes_count += 1
+                else:
+                    # Comparer les dates pour garder la plus récente
+                    existing_date_str = formatted_data[code_zone].get("date_ech", "")
+                    if existing_date_str:
+                        try:
+                            existing_date = datetime.strptime(existing_date_str, "%a, %d %b %Y %H:%M:%S GMT")
+                            if date_ech > existing_date:
+                                formatted_data[code_zone] = attrs
+                        except ValueError:
+                            # Si la date existante est invalide, remplacer
+                            formatted_data[code_zone] = attrs
+                    else:
+                        formatted_data[code_zone] = attrs
+
                 if date_dif_timestamp:
                     date_dif = datetime.fromtimestamp(date_dif_timestamp / 1000)
                     attrs["date_dif"] = date_dif.strftime("%a, %d %b %Y %H:%M:%S GMT")
-
-                # Ajouter la commune (en écrasant si déjà présente, car on ne prend que les données d'aujourd'hui)
-                formatted_data[code_zone] = attrs
-                communes_count += 1
 
             # Mettre à jour le cache
             cache_data = formatted_data
@@ -139,46 +173,88 @@ async def get_water_cuts():
     # Retourne simplement le contenu du fichier JSON que nous avons chargé au démarrage
     return water_cuts_data
 
-# Coordonnées des communes de Guadeloupe (lat, lon)
+# Coordonnées des communes de Guadeloupe (lat, lon) - Extraites du GeoJSON officiel
 COMMUNE_COORDINATES = {
-    "97101": {"name": "LES ABYMES", "lat": 16.2681, "lon": -61.5078},
-    "97102": {"name": "ANSE-BERTRAND", "lat": 16.4667, "lon": -61.5167},
-    "97103": {"name": "BAIE-MAHAULT", "lat": 16.2667, "lon": -61.5833},
-    "97104": {"name": "BAILLIF", "lat": 16.0167, "lon": -61.7417},
-    "97105": {"name": "BASSE-TERRE", "lat": 16.0000, "lon": -61.7333},
-    "97106": {"name": "BOUILLANTE", "lat": 16.1333, "lon": -61.7667},
-    "97107": {"name": "CAPESTERRE-BELLE-EAU", "lat": 16.0450, "lon": -61.5550},
-    "97108": {"name": "CAPESTERRE-DE-MARIE-GALANTE", "lat": 15.8833, "lon": -61.2000},
-    "97109": {"name": "GOURBEYRE", "lat": 16.0000, "lon": -61.6667},
-    "97110": {"name": "LA DÉSIRADE", "lat": 16.3167, "lon": -61.0000},
-    "97111": {"name": "DESHAIES", "lat": 16.3000, "lon": -61.8000},
-    "97112": {"name": "GRAND-BOURG", "lat": 15.8833, "lon": -61.3167},
-    "97113": {"name": "LE GOSIER", "lat": 16.2167, "lon": -61.5167},
-    "97114": {"name": "GOYAVE", "lat": 16.1167, "lon": -61.5667},
-    "97115": {"name": "LAMENTIN", "lat": 16.2667, "lon": -61.6500},
-    "97116": {"name": "MORNE-À-L'EAU", "lat": 16.3333, "lon": -61.4500},
-    "97117": {"name": "LE MOULE", "lat": 16.3333, "lon": -61.3500},
-    "97118": {"name": "PETIT-BOURG", "lat": 16.1833, "lon": -61.6000},
-    "97119": {"name": "PETIT-CANAL", "lat": 16.4167, "lon": -61.4333},
-    "97120": {"name": "POINTE-À-PITRE", "lat": 16.2417, "lon": -61.5333},
-    "97121": {"name": "POINTE-NOIRE", "lat": 16.2000, "lon": -61.7833},
-    "97122": {"name": "PORT-LOUIS", "lat": 16.4333, "lon": -61.5333},
-    "97124": {"name": "SAINT-CLAUDE", "lat": 16.0333, "lon": -61.6833},
-    "97125": {"name": "SAINT-FRANÇOIS", "lat": 16.2500, "lon": -61.2833},
-    "97126": {"name": "SAINT-LOUIS", "lat": 15.9667, "lon": -61.2667},
-    "97128": {"name": "SAINTE-ANNE", "lat": 16.2333, "lon": -61.3833},
-    "97129": {"name": "SAINTE-ROSE", "lat": 16.3333, "lon": -61.7000},
-    "97130": {"name": "TERRE-DE-BAS", "lat": 15.8667, "lon": -61.6500},
-    "97131": {"name": "TERRE-DE-HAUT", "lat": 15.8667, "lon": -61.5833},
-    "97132": {"name": "TROIS-RIVIÈRES", "lat": 16.0333, "lon": -61.6500},
-    "97133": {"name": "VIEUX-FORT", "lat": 15.9667, "lon": -61.7000},
-    "97134": {"name": "VIEUX-HABITANTS", "lat": 16.0667, "lon": -61.7667},
+    "97101": {"name": "Les Abymes", "lat": 16.269098, "lon": -61.491712},
+    "97102": {"name": "Anse-Bertrand", "lat": 16.471009, "lon": -61.506},
+    "97103": {"name": "Baie-Mahault", "lat": 16.250984, "lon": -61.593918},
+    "97104": {"name": "Baillif", "lat": 16.04277, "lon": -61.7313},
+    "97105": {"name": "Basse-Terre", "lat": 15.998443, "lon": -61.72447},
+    "97106": {"name": "Bouillante", "lat": 16.101058, "lon": -61.764318},
+    "97107": {"name": "Capesterre-Belle-Eau", "lat": 16.060373, "lon": -61.574103},
+    "97108": {"name": "Capesterre-de-Marie-Galante", "lat": 15.893608, "lon": -61.222379},
+    "97109": {"name": "Gourbeyre", "lat": 15.991118, "lon": -61.684582},
+    "97110": {"name": "La Désirade", "lat": 16.30279, "lon": -61.077034},
+    "97111": {"name": "Deshaies", "lat": 16.30812, "lon": -61.793379},
+    "97112": {"name": "Grand-Bourg", "lat": 15.902875, "lon": -61.307448},
+    "97113": {"name": "Le Gosier", "lat": 16.225134, "lon": -61.467175},
+    "97114": {"name": "Goyave", "lat": 16.130428, "lon": -61.585075},
+    "97115": {"name": "Lamentin", "lat": 16.246752, "lon": -61.650672},
+    "97116": {"name": "Morne-à-l'Eau", "lat": 16.321248, "lon": -61.457015},
+    "97117": {"name": "Le Moule", "lat": 16.32455, "lon": -61.352319},
+    "97118": {"name": "Petit-Bourg", "lat": 16.193519, "lon": -61.600424},
+    "97119": {"name": "Petit-Canal", "lat": 16.379163, "lon": -61.442341},
+    "97120": {"name": "Pointe-à-Pitre", "lat": 16.241587, "lon": -61.537708},
+    "97121": {"name": "Pointe-Noire", "lat": 16.210064, "lon": -61.780597},
+    "97122": {"name": "Port-Louis", "lat": 16.418389, "lon": -61.52852},
+    "97124": {"name": "Saint-Claude", "lat": 16.0167, "lon": -61.709911},
+    "97125": {"name": "Saint-François", "lat": 16.260504, "lon": -61.289773},
+    "97126": {"name": "Saint-Louis", "lat": 15.956251, "lon": -61.315493},
+    "97128": {"name": "Sainte-Anne", "lat": 16.257101, "lon": -61.352828},
+    "97129": {"name": "Sainte-Rose", "lat": 16.318948, "lon": -61.695059},
+    "97130": {"name": "Terre-de-Bas", "lat": 15.848911, "lon": -61.643872},
+    "97131": {"name": "Terre-de-Haut", "lat": 15.86704, "lon": -61.58231},
+    "97132": {"name": "Trois-Rivières", "lat": 15.979825, "lon": -61.641339},
+    "97133": {"name": "Vieux-Fort", "lat": 15.952554, "lon": -61.702531},
+    "97134": {"name": "Vieux-Habitants", "lat": 16.045746, "lon": -61.750473},
+    "97801": {"name": "Saint-Martin", "lat": 18.067043, "lon": -63.084698},
 }
 
 OPENWEATHER_API_KEY = "e352c87d50af4083d8fff74707a85b01"
 
-# Token Météo France
-METEOFRANCE_TOKEN = "eyJ4NXQiOiJOelU0WTJJME9XRXhZVGt6WkdJM1kySTFaakZqWVRJeE4yUTNNalEyTkRRM09HRmtZalkzTURkbE9UZ3paakUxTURRNFltSTVPR1kyTURjMVkyWTBNdyIsImtpZCI6Ik56VTRZMkkwT1dFeFlUa3paR0kzWTJJMVpqRmpZVEl4TjJRM01qUTJORFEzT0dGa1lqWTNNRGRsT1RnelpqRTFNRFE0WW1JNU9HWTJNRGMxWTJZME13X1JTMjU2IiwidHlwIjoiYXQrand0IiwiYWxnIjoiUlMyNTYifQ.eyJzdWIiOiIyMjMzZDljMi0yYzViLTRlOTQtYTQyZS0zYzVhMTIzODRlNzIiLCJhdXQiOiJBUFBMSUNBVElPTiIsImF1ZCI6IjhOSXFPRVV1cEtPd0NjelRHSVRLOWR3aF9mTWEiLCJuYmYiOjE3NjI0NjQxNDQsImF6cCI6IjhOSXFPRVV1cEtPd0NjelRHSVRLOWR3aF9mTWEiLCJzY29wZSI6ImRlZmF1bHQiLCJpc3MiOiJodHRwczpcL1wvcG9ydGFpbC1hcGkubWV0ZW9mcmFuY2UuZnJcL29hdXRoMlwvdG9rZW4iLCJleHAiOjE3NjI0Njc3NDQsImlhdCI6MTc2MjQ2NDE0NCwianRpIjoiYjEyNWFlNWEtYTUzMy00YjQxLWJmZjQtNTNjY2VkZjM4YWUwIiwiY2xpZW50X2lkIjoiOE5JcU9FVXVwS093Q2N6VEdJVEs5ZHdoX2ZNYSJ9.a0dXpF-5GI-lKWwpSBnyfI65LSWdMWD_1uW_Vnjw0UsaD9Kwci57-t69ZRTKm6Pa2SPQLUbZWJiVX4W1ufVEUGBGXwDC6uOv24dAH1Rlvf4JBsLIrM086ml4htTQ4iBH4KwuZY7zEuWHd3NJvoQOCkHeRP4AcdF9_12FvNCTig_b9mpxn1fnqSY6KdaFgFAlcfbQYyHLKILmExWCNAVpqnG8Djdv6GlPuwX69KhhdoAm0NwmfegPXaRQw3cBP1Gl2lUudNqn5W07FrOrMXRzVzUSTkwB-DU2mw1Ez4xHR9ElKSE7heSPQbCFswacaQCnnZfVoRo-wqBMewWKYrdhrA"
+# Credentials Météo France
+METEOFRANCE_CLIENT_ID = "8NIqOEUupKOwCczTGITK9dwh_fMa"
+METEOFRANCE_CLIENT_SECRET = "qbE3NvHD2Htx5KCDotz5XCBLQzga"
+METEOFRANCE_TOKEN = None
+METEOFRANCE_TOKEN_EXPIRY = 0
+
+async def get_meteofrance_token():
+    """Obtenir ou rafraîchir le token Météo-France"""
+    global METEOFRANCE_TOKEN, METEOFRANCE_TOKEN_EXPIRY
+
+    current_time = time.time()
+
+    # Si le token existe et n'est pas expiré (avec marge de 5 minutes)
+    if METEOFRANCE_TOKEN and current_time < (METEOFRANCE_TOKEN_EXPIRY - 300):
+        return METEOFRANCE_TOKEN
+
+    # Sinon, générer un nouveau token
+    async with httpx.AsyncClient() as client:
+        try:
+            import base64
+            credentials = f"{METEOFRANCE_CLIENT_ID}:{METEOFRANCE_CLIENT_SECRET}"
+            encoded_credentials = base64.b64encode(credentials.encode()).decode()
+
+            response = await client.post(
+                "https://portail-api.meteofrance.fr/token",
+                headers={
+                    "Authorization": f"Basic {encoded_credentials}",
+                    "Content-Type": "application/x-www-form-urlencoded"
+                },
+                data="grant_type=client_credentials"
+            )
+            response.raise_for_status()
+            token_data = response.json()
+
+            METEOFRANCE_TOKEN = token_data["access_token"]
+            METEOFRANCE_TOKEN_EXPIRY = current_time + token_data.get("expires_in", 3600)
+
+            print(f"[Météo-France] Nouveau token généré, expire dans {token_data.get('expires_in', 3600)}s")
+            return METEOFRANCE_TOKEN
+
+        except Exception as e:
+            print(f"Erreur lors de la génération du token Météo-France: {e}")
+            raise
 
 # Cache pour les données météo
 weather_cache_data = None
@@ -188,7 +264,7 @@ WEATHER_CACHE_TTL = 3600  # Cache valide pendant 1 heure (pas besoin de temps r�
 # Cache pour la vigilance météo
 vigilance_cache_data = None
 vigilance_cache_timestamp = 0
-VIGILANCE_CACHE_TTL = 7200  # Cache valide pendant 2 heures (pas besoin de temps réel)
+VIGILANCE_CACHE_TTL = 600  # Cache valide pendant 10 minutes (pour avoir des données plus fraîches)
 
 @app.get("/api/weather")
 async def get_weather():
@@ -200,60 +276,219 @@ async def get_weather():
     if weather_cache_data is not None and (current_time - weather_cache_timestamp) < WEATHER_CACHE_TTL:
         return weather_cache_data
 
-    # Récupérer les données météo pour chaque commune
+    # Fonction pour récupérer les données météo d'une commune
+    async def fetch_commune_weather(client: httpx.AsyncClient, code_zone: str, info: dict):
+        try:
+            from datetime import datetime
+
+            # Appel à l'API OpenWeatherMap avec plus de données (onecall inclut plus d'infos)
+            url = f"https://api.openweathermap.org/data/2.5/weather?lat={info['lat']}&lon={info['lon']}&appid={OPENWEATHER_API_KEY}&units=metric&lang=fr"
+            response = await client.get(url, timeout=10.0)
+            response.raise_for_status()
+            data = response.json()
+
+            # Calculer le point de rosée (approximation)
+            temp = data["main"]["temp"]
+            humidity = data["main"]["humidity"]
+            dew_point = temp - ((100 - humidity) / 5)
+
+            # Extraire les informations pertinentes avec plus de détails
+            weather_data = {
+                "lib_zone": info["name"],
+                "code_zone": code_zone,
+                "temperature": round(data["main"]["temp"], 1),
+                "feels_like": round(data["main"]["feels_like"], 1),
+                "temp_min": round(data["main"]["temp_min"], 1),
+                "temp_max": round(data["main"]["temp_max"], 1),
+                "humidity": data["main"]["humidity"],
+                "pressure": data["main"]["pressure"],
+                "wind_speed": round(data["wind"]["speed"] * 3.6, 1),  # Convertir m/s en km/h
+                "wind_deg": data["wind"].get("deg", 0),
+                "wind_gust": round(data["wind"].get("gust", 0) * 3.6, 1) if data["wind"].get("gust") else None,
+                "weather_main": data["weather"][0]["main"],
+                "weather_description": data["weather"][0]["description"],
+                "weather_icon": data["weather"][0]["icon"],
+                "clouds": data["clouds"]["all"],
+                "visibility": data.get("visibility", 10000),  # en mètres
+                "dew_point": round(dew_point, 1),
+                "sunrise": datetime.fromtimestamp(data["sys"]["sunrise"]).strftime("%H:%M"),
+                "sunset": datetime.fromtimestamp(data["sys"]["sunset"]).strftime("%H:%M"),
+                "timezone": data.get("timezone", 0),
+                "rain_1h": data.get("rain", {}).get("1h", 0) if "rain" in data else 0,
+                "rain_3h": data.get("rain", {}).get("3h", 0) if "rain" in data else 0,
+            }
+
+            # Ajouter l'indice UV si disponible (nécessite un appel séparé à onecall)
+            # Pour l'instant, on le calcule de manière approximative basé sur l'heure et les nuages
+            try:
+                current_hour = datetime.now().hour
+                # Indice UV approximatif pour la Guadeloupe (latitudes tropicales)
+                if 6 <= current_hour <= 18:  # Jour
+                    base_uv = 8 if 10 <= current_hour <= 14 else 5  # Fort au midi
+                    # Ajuster selon la couverture nuageuse
+                    cloud_factor = 1 - (data["clouds"]["all"] / 200)  # Réduction si nuageux
+                    weather_data["uv_index"] = round(base_uv * max(cloud_factor, 0.3), 1)
+                else:
+                    weather_data["uv_index"] = 0
+            except Exception:
+                weather_data["uv_index"] = None
+
+            return (code_zone, weather_data)
+        except Exception as e:
+            print(f"Erreur pour {info['name']}: {e}")
+            # En cas d'erreur, on met des valeurs par défaut
+            return (code_zone, {
+                "lib_zone": info["name"],
+                "code_zone": code_zone,
+                "temperature": None,
+                "feels_like": None,
+                "temp_min": None,
+                "temp_max": None,
+                "humidity": None,
+                "pressure": None,
+                "wind_speed": None,
+                "wind_deg": None,
+                "wind_gust": None,
+                "weather_main": "N/A",
+                "weather_description": "Données non disponibles",
+                "weather_icon": "01d",
+                "clouds": None,
+                "visibility": None,
+                "dew_point": None,
+                "sunrise": None,
+                "sunset": None,
+                "timezone": None,
+                "rain_1h": 0,
+                "rain_3h": 0,
+                "uv_index": None,
+            })
+
+    # Récupérer les données météo pour toutes les communes en parallèle
+    import asyncio
     weather_data = {}
 
-    async with httpx.AsyncClient() as client:
-        for code_zone, info in COMMUNE_COORDINATES.items():
-            try:
-                # Appel à l'API OpenWeatherMap
-                url = f"https://api.openweathermap.org/data/2.5/weather?lat={info['lat']}&lon={info['lon']}&appid={OPENWEATHER_API_KEY}&units=metric&lang=fr"
-                response = await client.get(url)
-                response.raise_for_status()
-                data = response.json()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        # Créer toutes les tâches en parallèle
+        tasks = [
+            fetch_commune_weather(client, code_zone, info)
+            for code_zone, info in COMMUNE_COORDINATES.items()
+        ]
 
-                # Extraire les informations pertinentes
-                weather_data[code_zone] = {
-                    "lib_zone": info["name"],
-                    "code_zone": code_zone,
-                    "temperature": round(data["main"]["temp"], 1),
-                    "feels_like": round(data["main"]["feels_like"], 1),
-                    "temp_min": round(data["main"]["temp_min"], 1),
-                    "temp_max": round(data["main"]["temp_max"], 1),
-                    "humidity": data["main"]["humidity"],
-                    "pressure": data["main"]["pressure"],
-                    "wind_speed": round(data["wind"]["speed"] * 3.6, 1),  # Convertir m/s en km/h
-                    "wind_deg": data["wind"].get("deg", 0),
-                    "weather_main": data["weather"][0]["main"],
-                    "weather_description": data["weather"][0]["description"],
-                    "weather_icon": data["weather"][0]["icon"],
-                    "clouds": data["clouds"]["all"],
-                }
-            except Exception as e:
-                print(f"Erreur pour {info['name']}: {e}")
-                # En cas d'erreur, on met des valeurs par défaut
-                weather_data[code_zone] = {
-                    "lib_zone": info["name"],
-                    "code_zone": code_zone,
-                    "temperature": 0,
-                    "feels_like": 0,
-                    "temp_min": 0,
-                    "temp_max": 0,
-                    "humidity": 0,
-                    "pressure": 0,
-                    "wind_speed": 0,
-                    "wind_deg": 0,
-                    "weather_main": "N/A",
-                    "weather_description": "Données non disponibles",
-                    "weather_icon": "01d",
-                    "clouds": 0,
-                }
+        # Exécuter toutes les tâches en parallèle
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Construire le dictionnaire de résultats
+        for result in results:
+            if isinstance(result, Exception):
+                print(f"Erreur lors de la récupération des données météo: {result}")
+                continue
+            code_zone, data = result
+            weather_data[code_zone] = data
 
     # Mettre à jour le cache
     weather_cache_data = weather_data
     weather_cache_timestamp = current_time
 
+    print(f"[Weather] Données récupérées pour {len(weather_data)} communes en parallèle")
+
     return weather_data
+
+# Cache pour les prévisions météo
+forecast_cache_data = None
+forecast_cache_timestamp = 0
+FORECAST_CACHE_TTL = 10800  # Cache valide pendant 3 heures
+
+@app.get("/api/forecast/{code_zone}")
+async def get_forecast(code_zone: str):
+    """Obtenir les prévisions météo pour une commune spécifique (5 jours)"""
+    global forecast_cache_data, forecast_cache_timestamp
+
+    current_time = time.time()
+
+    # Vérifier si le code_zone existe
+    if code_zone not in COMMUNE_COORDINATES:
+        return {"error": f"Commune {code_zone} non trouvée"}
+
+    # Vérifier le cache pour cette commune
+    cache_key = f"forecast_{code_zone}"
+    if (forecast_cache_data is not None and
+        cache_key in forecast_cache_data and
+        (current_time - forecast_cache_timestamp) < FORECAST_CACHE_TTL):
+        return forecast_cache_data[cache_key]
+
+    commune = COMMUNE_COORDINATES[code_zone]
+
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            # Appel à l'API de prévisions (5 jours / 3h)
+            url = f"https://api.openweathermap.org/data/2.5/forecast?lat={commune['lat']}&lon={commune['lon']}&appid={OPENWEATHER_API_KEY}&units=metric&lang=fr&cnt=40"
+            response = await client.get(url)
+            response.raise_for_status()
+            data = response.json()
+
+            # Organiser les prévisions par jour
+            from datetime import datetime
+            forecasts_by_day = {}
+
+            for item in data["list"]:
+                dt = datetime.fromtimestamp(item["dt"])
+                day_key = dt.strftime("%Y-%m-%d")
+
+                if day_key not in forecasts_by_day:
+                    forecasts_by_day[day_key] = []
+
+                forecasts_by_day[day_key].append({
+                    "time": dt.strftime("%H:%M"),
+                    "timestamp": item["dt"],
+                    "temperature": round(item["main"]["temp"], 1),
+                    "feels_like": round(item["main"]["feels_like"], 1),
+                    "temp_min": round(item["main"]["temp_min"], 1),
+                    "temp_max": round(item["main"]["temp_max"], 1),
+                    "humidity": item["main"]["humidity"],
+                    "pressure": item["main"]["pressure"],
+                    "weather_main": item["weather"][0]["main"],
+                    "weather_description": item["weather"][0]["description"],
+                    "weather_icon": item["weather"][0]["icon"],
+                    "clouds": item["clouds"]["all"],
+                    "wind_speed": round(item["wind"]["speed"] * 3.6, 1),
+                    "wind_deg": item["wind"].get("deg", 0),
+                    "pop": round(item.get("pop", 0) * 100),  # Probabilité de précipitation en %
+                    "rain_3h": item.get("rain", {}).get("3h", 0),
+                })
+
+            # Calculer les min/max par jour
+            daily_summary = {}
+            for day, forecasts in forecasts_by_day.items():
+                temps = [f["temperature"] for f in forecasts]
+                daily_summary[day] = {
+                    "date": day,
+                    "temp_min": round(min(temps), 1),
+                    "temp_max": round(max(temps), 1),
+                    "hourly": forecasts,
+                    # Prendre la météo la plus représentative (vers midi)
+                    "main_weather": forecasts[len(forecasts)//2]["weather_main"],
+                    "main_weather_description": forecasts[len(forecasts)//2]["weather_description"],
+                    "main_weather_icon": forecasts[len(forecasts)//2]["weather_icon"],
+                }
+
+            result = {
+                "code_zone": code_zone,
+                "lib_zone": commune["name"],
+                "daily": daily_summary,
+                "city": data["city"]
+            }
+
+            # Mettre à jour le cache
+            if forecast_cache_data is None:
+                forecast_cache_data = {}
+            forecast_cache_data[cache_key] = result
+            forecast_cache_timestamp = current_time
+
+            return result
+
+    except Exception as e:
+        print(f"Erreur lors de la récupération des prévisions pour {commune['name']}: {e}")
+        return {"error": str(e), "code_zone": code_zone, "lib_zone": commune["name"]}
 
 @app.get("/api/vigilance")
 async def get_vigilance():
@@ -263,58 +498,86 @@ async def get_vigilance():
 
     # Vérifier si le cache est encore valide
     if vigilance_cache_data is not None and (current_time - vigilance_cache_timestamp) < VIGILANCE_CACHE_TTL:
+        print(f"[Cache] Utilisation du cache vigilance (âge: {int(current_time - vigilance_cache_timestamp)}s)")
         return vigilance_cache_data
 
-    # Récupérer les données de vigilance depuis Météo France
-    async with httpx.AsyncClient() as client:
+    print("[API] Appel à l'API Météo-France pour la vigilance...")
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
         try:
-            # Appel à l'API de vigilance Météo France pour la Guadeloupe (971)
-            url = "https://portail-api.meteofrance.fr/public/DPVigilance/v1/cartevigilance/encours"
+            # Obtenir le token
+            token = await get_meteofrance_token()
+
+            # Télécharger le fichier ZIP de vigilance outre-mer
+            url = "https://public-api.meteofrance.fr/public/DPVigilance/v1/vigilanceom/flux/dernier"
             headers = {
-                "Authorization": f"Bearer {METEOFRANCE_TOKEN}",
-                "Accept": "application/json"
+                "Authorization": f"Bearer {token}"
             }
+
             response = await client.get(url, headers=headers)
             response.raise_for_status()
-            data = response.json()
 
-            # Parser les données pour extraire le niveau de vigilance pour la Guadeloupe
-            # La structure exacte dépend de l'API, on cherche le département 971
-            vigilance_level = 1  # Par défaut: vert (pas de vigilance)
-            vigilance_color = "#28d761"  # Vert par défaut
+            # Extraire le contenu du ZIP
+            zip_data = io.BytesIO(response.content)
+            with zipfile.ZipFile(zip_data, 'r') as zip_ref:
+                # Le fichier qui contient les données de la Guadeloupe est CDPV85_TFFR_.txt
+                vigilance_file = "CDPV85_TFFR_.txt"
+
+                if vigilance_file not in zip_ref.namelist():
+                    raise Exception(f"Fichier {vigilance_file} non trouvé dans le ZIP")
+
+                # Lire et parser le fichier JSON
+                with zip_ref.open(vigilance_file) as f:
+                    vigilance_json = json.loads(f.read().decode('utf-8'))
+
+            # Extraire les données pour la Guadeloupe (VIGI971)
+            vigilance_level = 1  # Par défaut: vert
+            vigilance_color = "#28d761"
             vigilance_label = "Vert"
             vigilance_risks = []
 
-            # Chercher la Guadeloupe dans les données
-            if "product" in data and "periods" in data["product"]:
-                for period in data["product"]["periods"]:
-                    if "timelaps" in period and "domain_ids" in period["timelaps"]:
-                        for domain in period["timelaps"]["domain_ids"]:
-                            if domain.get("domain_id") == "971":
-                                # Récupérer le niveau maximum de vigilance
-                                if "phenomenon_items" in domain:
-                                    max_level = 1
-                                    risks = []
-                                    for phenomenon in domain["phenomenon_items"]:
-                                        level = phenomenon.get("phenomenon_max_color_id", 1)
-                                        if level > max_level:
-                                            max_level = level
-                                        risks.append({
-                                            "type": phenomenon.get("phenomenon_id", ""),
-                                            "level": level
-                                        })
-                                    vigilance_level = max_level
-                                    vigilance_risks = risks
+            # Chercher VIGI971 dans les données
+            if "timelaps" in vigilance_json and "domain_ids" in vigilance_json["timelaps"]:
+                for domain in vigilance_json["timelaps"]["domain_ids"]:
+                    if domain["domain_id"] == "VIGI971":
+                        vigilance_level = domain.get("max_color_id", 1)
 
-            # Mapper les niveaux aux couleurs et labels
-            level_mapping = {
+                        # Extraire les risques
+                        for phenomenon in domain.get("phenomenon_items", []):
+                            pheno_id = phenomenon.get("phenomenon_id")
+                            pheno_level = phenomenon.get("phenomenon_max_color_id", -1)
+
+                            # Mapper les phenomenon_id aux noms (basé sur la doc Météo-France)
+                            phenomenon_names = {
+                                1: "Vent",
+                                2: "Pluie-inondation",
+                                3: "Orages",
+                                4: "Crues",
+                                5: "Neige-verglas",
+                                6: "Canicule",
+                                7: "Grand froid",
+                                8: "Avalanches",
+                                9: "Vagues-submersion",
+                                10: "Mer-houle"
+                            }
+
+                            if pheno_level >= 1:  # Ne pas inclure les phénomènes avec level -1 ou 0
+                                vigilance_risks.append({
+                                    "type": phenomenon_names.get(pheno_id, f"Phénomène {pheno_id}"),
+                                    "level": pheno_level
+                                })
+                        break
+
+            # Mapping niveau -> couleur et label
+            vigilance_info = {
+                -1: {"color": "#CCCCCC", "label": "Non disponible"},
+                0: {"color": "#28d761", "label": "Vert"},
                 1: {"color": "#28d761", "label": "Vert"},
                 2: {"color": "#FFFF00", "label": "Jaune"},
                 3: {"color": "#FF9900", "label": "Orange"},
-                4: {"color": "#FF0000", "label": "Rouge"},
-            }
+                4: {"color": "#FF0000", "label": "Rouge"}
+            }.get(vigilance_level, {"color": "#28d761", "label": "Vert"})
 
-            vigilance_info = level_mapping.get(vigilance_level, level_mapping[1])
             vigilance_color = vigilance_info["color"]
             vigilance_label = vigilance_info["label"]
 
@@ -332,10 +595,15 @@ async def get_vigilance():
             vigilance_cache_data = result
             vigilance_cache_timestamp = current_time
 
+            print(f"[Vigilance] Niveau: {vigilance_label} ({vigilance_level}), Risques: {len(vigilance_risks)}")
+
             return result
 
         except Exception as e:
             print(f"Erreur lors de la récupération de la vigilance: {e}")
+            import traceback
+            traceback.print_exc()
+
             # En cas d'erreur, retourner des valeurs par défaut
             default_result = {
                 "department": "971",
@@ -348,7 +616,7 @@ async def get_vigilance():
                 "error": str(e)
             }
 
-            # Mettre à jour le cache même en cas d'erreur
+            # Mettre à jour le cache même en cas d'erreur pour éviter trop d'appels
             vigilance_cache_data = default_result
             vigilance_cache_timestamp = current_time
 
